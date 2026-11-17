@@ -1,0 +1,166 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- ==================== 基础信息 ==================== -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!--
+      ⚠️ 必须是 net8.0-windows，不能带 10.0.19041.0 后缀。
+      带版本号的后缀会让 SDK 引入 Windows SDK 的 WinRT 投影（Microsoft.Windows.SDK.NET），
+      实测让 AOT 产物从 0.8MB 涨到 4.2MB。本项目已经完全不用 WinRT（改走 SetupAPI/CfgMgr32），
+      所以只保留 net8.0-windows —— 它提供 Windows 专属 API（如注册表），但不带 WinRT 投影。
+    -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+
+    <RootNamespace>BtBattery</RootNamespace>
+    <AssemblyName>BtBattery</AssemblyName>
+    <Version>0.5.4</Version>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <!-- 托盘图标绘制用指针写 DIB 像素，需要 unsafe -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 由 tools/make_icon.py 生成，PNG 压缩，约 3KB（原来的 285KB 图标已替换） -->
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <!-- ==================== Native AOT ==================== -->
+  <!--
+    本项目已不再使用任何 WinRT API（蓝牙走 SetupAPI/CfgMgr32，见 Helpers/PnPBluetooth.cs），
+    因此不需要 CsWinRTAotOptimizerEnabled / BuiltInComInteropSupport / WindowsPackageType。
+    如果以后又要用 Windows.Devices.* 这类 WinRT API，把 TargetFramework 改回
+    net8.0-windows10.0.19041.0，并把上面几个开关加回来（且要接受体积涨到 4MB+）。
+  -->
+  <!--
+    RuntimeIdentifiers（复数）而不是 RuntimeIdentifier（单数）：
+    这样发布时可以用 -r 任选一个目标架构，同时支持 x64 与 ARM64（Copilot+ PC 等）。
+      dotnet publish -c Release -r win-x64
+      dotnet publish -c Release -r win-arm64
+    ⚠️ AOT 交叉编译到 ARM64 需要装有 ARM64 版 MSVC 原生工具链的机器，x64 机器上
+       发布 win-arm64 会因缺少工具链而失败。需要时在对应架构的机器上发布。
+  -->
+  <PropertyGroup>
+    <PublishAot>true</PublishAot>
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>full</TrimMode>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <!-- ==================== 体积优化（本项目的核心约束） ==================== -->
+  <!--
+    目标：单文件 exe < 1MB。
+    只有两条路，且必须同时走：
+      1) 不用任何 UI 框架 —— Avalonia 会带进 libSkiaSharp 9.4MB + av_libglesv2 5.4MB
+         + libHarfBuzzSharp 1.8MB，光这三个原生库就 16.6MB，1MB 根本不可能
+      2) Native AOT + 下面这些开关，把运行时本身压到最小
+  -->
+  <PropertyGroup>
+    <!--
+      体积优先于吞吐。
+      ⚠️ 属性名是 OptimizationPreference，**不是** IlcOptimizationPreference ——
+         ILCompiler 的 Microsoft.NETCore.Native.targets 只读 $(OptimizationPreference)，
+         据此决定给 ilc 追加 Os（按体积优化）还是 Ot（按速度优化）参数。
+         写错名字 MSBuild 不报错、只是静默忽略，等于这个开关从来没生效过
+         （旧版就是写错的，2026-10-11 修正）。
+    -->
+    <OptimizationPreference>Size</OptimizationPreference>
+    <IsAotCompatible>true</IsAotCompatible>
+
+    <!-- 折叠完全相同的方法体（泛型实例化会产生大量重复代码），通常能省几百 KB -->
+    <IlcFoldIdenticalMethodBodies>true</IlcFoldIdenticalMethodBodies>
+
+    <!--
+      本项目不用反射（没有 XAML、没有依赖注入、没有序列化器），关掉反射元数据与调用桩，
+      实测能省约 40% 体积。
+      ⚠️ 后果：Type.GetType / Activator.CreateInstance / 反射调用全部不可用。
+      ⚠️ 前提：不能用 WinRT —— CsWinRT 的 COM 互操作需要反射，开了会启动即崩
+              （Unhandled Exception: Reflection_Disabled）。这也是本项目改成纯 Win32 的原因之一。
+    -->
+    <IlcDisableReflection>true</IlcDisableReflection>
+
+    <!--
+      ⚠️ 这里原来还有一行 <RootAllApplicationAssemblies>false</RootAllApplicationAssemblies>，
+         但 .NET 8 的 ILCompiler 里**不存在**这个 MSBuild 属性（把 SDK 与 ILCompiler 包里
+         所有 .targets/.props 全量搜过，零命中），写了不生效，2026-10-11 移除，
+         免得给人「已经做了这项优化」的错觉。
+         注：IlcDisableReflection=true 已经隐含了不扫反射（targets 里 scanreflection 开关的
+         条件本身就带 $(IlcDisableReflection) != 'true'），所以不需要再补别的开关。
+    -->
+
+    <!-- 不需要后台并发 GC，去掉这部分代码 -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+
+    <!--
+      剥离调试符号。
+      ⚠️ 在 Windows 目标上这是空操作：targets 里所有 StripSymbols 相关的步骤都带
+         '$(_targetOS)' != 'win' 条件。真正让发布产物不带 pdb 的是发布时的
+         -p:DebugType=none（见项目发布命令），这里保留只是明确意图。
+    -->
+    <StripSymbols>true</StripSymbols>
+
+    <!-- 去掉异常消息的本地化资源（异常照常抛，只是消息变成资源键） -->
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+
+    <!-- 不需要栈帧/行号映射：日志是自研的，不依赖 StackTrace -->
+    <StackTraceSupport>false</StackTraceSupport>
+
+    <!--
+      用 Windows 线程池实现，省掉托管线程池那部分代码。
+      注：Windows 目标下这本就是默认值（targets 里 _targetOS == 'win' 时默认 true），
+      显式写出来只是自文档化，不产生额外效果。
+    -->
+    <UseWindowsThreadPool>true</UseWindowsThreadPool>
+
+    <!-- 关闭热重载、调试器、EventSource 等运行时附加设施 -->
+    <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+    <DebuggerSupport>false</DebuggerSupport>
+    <EventSourceSupport>false</EventSourceSupport>
+
+    <EnableUnsafeUTF7Encoding>false</EnableUnsafeUTF7Encoding>
+    <AutoreleasePoolSupport>false</AutoreleasePoolSupport>
+    <CustomResourceTypesSupport>false</CustomResourceTypesSupport>
+
+    <!--
+      UI 层已经不再 new CultureInfo("zh-cn")（那是旧版 Semi.Avalonia 主题需要的），
+      所以可以开固定区域性，省掉一整套区域性数据。
+      ⚠️ 若以后重新引入任何需要特定区域性的代码，这里要改回 false。
+    -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <!-- ==================== BCL 特性开关 ==================== -->
+  <!--
+    这些是「整块功能」的开关：置为 false 后，库里的 ILLink 替换会把对应代码整体裁掉。
+    本项目一个都用不到，全关。每项的取舍写在后面。
+  -->
+  <ItemGroup>
+    <!-- 不用 TypeConverter / 设计时属性 -->
+    <RuntimeHostConfigurationOption Include="System.ComponentModel.TypeDescriptor.IsSupported" Value="false" Trim="true" />
+    <!-- 不用 COM 互操作（蓝牙走 SetupAPI/CfgMgr32 的纯 C 接口，不是 COM） -->
+    <RuntimeHostConfigurationOption Include="System.Runtime.InteropServices.BuiltInComInterop.IsSupported" Value="false" Trim="true" />
+    <!-- 不需要启动钩子 -->
+    <RuntimeHostConfigurationOption Include="System.StartupHookProvider.IsSupported" Value="false" Trim="true" />
+    <!-- 不需要动态代码生成（AOT 本来就不支持） -->
+    <RuntimeHostConfigurationOption Include="System.Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeCompiled" Value="false" Trim="true" />
+    <!-- 不用表达式树编译 -->
+    <RuntimeHostConfigurationOption Include="System.Linq.Expressions.CanCompileToIL" Value="false" Trim="true" />
+    <!-- 不用 BinaryFormatter -->
+    <RuntimeHostConfigurationOption Include="System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization" Value="false" Trim="true" />
+    <!-- 不用正则 -->
+    <RuntimeHostConfigurationOption Include="System.Text.RegularExpressions.IsSupported" Value="false" Trim="true" />
+    <!-- 不用加密 -->
+    <RuntimeHostConfigurationOption Include="System.Security.Cryptography.Aes.IsSupported" Value="false" Trim="true" />
+    <RuntimeHostConfigurationOption Include="System.Security.Cryptography.Rsa.IsSupported" Value="false" Trim="true" />
+    <!-- 不用网络 -->
+    <RuntimeHostConfigurationOption Include="System.Net.Http.IsSupported" Value="false" Trim="true" />
+    <RuntimeHostConfigurationOption Include="System.Net.Sockets.IsSupported" Value="false" Trim="true" />
+    <!-- 不用代码页（InvariantGlobalization 下只有 UTF-8/UTF-16） -->
+    <RuntimeHostConfigurationOption Include="System.Text.Encoding.EnableCodePages" Value="false" Trim="true" />
+  </ItemGroup>
+
+</Project>
