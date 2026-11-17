@@ -72,7 +72,6 @@ src/BtBattery/     主程序源码（Helpers / Models / Services / UI）
   Models/          设置与设备状态模型
   Services/        轮询监控服务、设置持久化、气泡通知
   UI/              托盘应用、图标绘制、Win32 互操作
-tools/make_icon.py 生成程序图标（PNG 压缩 ICO）
 BtBattery.sln      解决方案文件
 ```
 
